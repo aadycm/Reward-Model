@@ -1,56 +1,72 @@
 """
 XGBoost pairwise reward model for recourse preferences.
 
-Run:  python train_xgb.py --data mock_data --study study1
-      python train_xgb.py --data /path/to/real/folder --study study2
+Run:  python train_xgb.py --study study1                      (mock data)
+      python train_xgb.py --data /path/to/real --study study2  (real data, secure machine only)
 
-Expects <data>/<study>_preference_train.csv and <data>/<study>_preference_test.csv.
+Expects <data>/<study>_preference_train.csv and <data>/<study>_preference_test.csv,
+or pass --train / --test with exact file paths.
 Prints ONLY summary numbers, never rows, so the output is safe to share.
 """
-import argparse, json
+import argparse, json, sys
 import numpy as np
 import pandas as pd
 from xgboost import XGBRanker
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-# !! CHECK WITH FIRDAUS: what does user_choice mean? This script assumes 0 = picked cf1, 1 = picked cf2.
-# If it is the other way round, set this to False. Getting it wrong flips accuracy to (1 - accuracy).
-CHOICE_1_MEANS_CF2 = True
-
+# !! CHECK WITH FIRDAUS: what does user_choice mean? Assumed: 0 = picked cf1, 1 = picked cf2.
+# If it is the other way round, run with --flip. Getting it wrong turns accuracy into (1 - accuracy).
 OPTS = ["cf1_feats_values", "cf2_feats_values"]
+COLS = ["pid", "scenario_num", "original"] + OPTS + ["user_choice"]
 
 
 def load(path):
-    df = pd.read_csv(path, sep=None, engine="python")          # handles tab or comma
+    with open(path, encoding="utf-8-sig") as fh:
+        header = fh.readline()
+    sep = "\t" if "\t" in header else ","
+    df = pd.read_csv(path, sep=sep, encoding="utf-8-sig")
+    df.columns = [c.strip() for c in df.columns]
+    missing = [c for c in COLS if c not in df.columns]
+    if missing:
+        sys.exit(f"{path}: missing columns {missing}. Found {list(df.columns)}")
     for c in ["original"] + OPTS:
-        df[c] = df[c].apply(json.loads)
+        try:
+            df[c] = df[c].apply(json.loads)
+        except Exception as e:
+            sys.exit(f"{path}: could not parse JSON in column '{c}' ({type(e).__name__}). Check the cell format.")
+    bad = set(df["user_choice"].unique()) - {0, 1}
+    if bad:
+        sys.exit(f"{path}: user_choice has values other than 0/1: {sorted(bad)}. Update the label mapping.")
     df["user_choice"] = df["user_choice"].astype(int)
+    keys = set(df["original"].iloc[0])
+    for c in ["original"] + OPTS:
+        if any(set(d) != keys for d in df[c]):
+            sys.exit(f"{path}: column '{c}' has rows with different feature names.")
     return df
 
 
 def split_types(df):
     """Numeric = every value parses as a number (handles '108480' strings). Rest = categorical."""
-    keys = list(df["original"].iloc[0].keys())
     num, cat = [], []
-    for k in keys:
-        vals = pd.to_numeric(pd.Series([d[k] for d in df["original"]]), errors="coerce")
+    for k in df["original"].iloc[0]:
+        vals = pd.to_numeric(pd.Series([d[k] for col in ["original"] + OPTS for d in df[col]]), errors="coerce")
         (num if vals.notna().all() else cat).append(k)
     return num, cat
 
 
 def option_features(df, opt, num, cat, scale, cats):
     """One row of features per (scenario, option): context + what changed + how much."""
-    o = pd.DataFrame(list(df["original"]))
-    c = pd.DataFrame(list(df[opt]))
+    o = pd.DataFrame(list(df["original"]), index=df.index)
+    c = pd.DataFrame(list(df[opt]), index=df.index)
     X = pd.DataFrame(index=df.index)
-    l1 = 0
+    l1 = pd.Series(0.0, index=df.index)
     for f in num:
-        ov, cv = pd.to_numeric(o[f]), pd.to_numeric(c[f])
+        ov, cv = pd.to_numeric(o[f], errors="coerce"), pd.to_numeric(c[f], errors="coerce")
         d = (cv - ov) / scale[f]
         X[f"orig_{f}"] = ov
         X[f"delta_{f}"] = d
         X[f"changed_{f}"] = (cv != ov).astype(int)
-        l1 = l1 + d.abs()
+        l1 = l1 + d.abs().fillna(0)
     for f in cat:
         ov, cv = o[f].astype(str).str.strip(), c[f].astype(str).str.strip()
         X[f"changed_{f}"] = (cv != ov).astype(int)
@@ -62,64 +78,78 @@ def option_features(df, opt, num, cat, scale, cats):
     return X
 
 
-def to_ranking(df, num, cat, scale, cats):
-    """Stack cf1 and cf2 rows; each scenario is one query group of 2."""
+def build(df, num, cat, scale, cats, flip):
     X1 = option_features(df, OPTS[0], num, cat, scale, cats)
     X2 = option_features(df, OPTS[1], num, cat, scale, cats)
-    picked_cf2 = df["user_choice"] == (1 if CHOICE_1_MEANS_CF2 else 0)
-    n = len(df)
+    picked_cf2 = (df["user_choice"].values == (0 if flip else 1)).astype(int)
+    return X1, X2, picked_cf2
+
+
+def to_ranking(X1, X2, picked_cf2):
+    """Interleave rows: [s0 cf1, s0 cf2, s1 cf1, s1 cf2, ...]; each scenario is one query group of 2."""
+    n = len(X1)
     X = pd.concat([X1, X2]).reset_index(drop=True)
-    y = np.concatenate([(~picked_cf2).astype(int), picked_cf2.astype(int)])
+    y = np.concatenate([1 - picked_cf2, picked_cf2])
     qid = np.concatenate([np.arange(n), np.arange(n)])
-    order = np.argsort(qid, kind="stable")                    # XGBRanker needs groups contiguous
-    return X.iloc[order].reset_index(drop=True), y[order], qid[order], X1, X2, picked_cf2.astype(int).values
+    order = np.argsort(qid, kind="stable")
+    return X.iloc[order].reset_index(drop=True), y[order], qid[order]
 
 
-def report(name, y_true_cf2, pred_cf2):
-    print(f"  {name:<22} acc={accuracy_score(y_true_cf2, pred_cf2):.3f}  "
-          f"f1={f1_score(y_true_cf2, pred_cf2):.3f}  "
-          f"prec={precision_score(y_true_cf2, pred_cf2, zero_division=0):.3f}  "
-          f"rec={recall_score(y_true_cf2, pred_cf2):.3f}")
+def report(name, y, pred):
+    print(f"  {name:<22} acc={accuracy_score(y, pred):.3f}  "
+          f"f1={f1_score(y, pred, zero_division=0):.3f}  "
+          f"prec={precision_score(y, pred, zero_division=0):.3f}  "
+          f"rec={recall_score(y, pred, zero_division=0):.3f}")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="mock_data")
     ap.add_argument("--study", default="study1", choices=["study1", "study2"])
-    a = ap.parse_args()
+    ap.add_argument("--train"); ap.add_argument("--test")
+    ap.add_argument("--flip", action="store_true", help="use if user_choice 1 means cf1")
+    ap.add_argument("--seed", type=int, default=0)
+    a = ap.parse_args(argv)
 
-    tr = load(f"{a.data}/{a.study}_preference_train.csv")
-    te = load(f"{a.data}/{a.study}_preference_test.csv")
+    tr = load(a.train or f"{a.data}/{a.study}_preference_train.csv")
+    te = load(a.test or f"{a.data}/{a.study}_preference_test.csv")
     num, cat = split_types(tr)
+    if split_types(te) != (num, cat):
+        sys.exit("Train and test files have different features or types.")
 
-    # Fit scaling and category lists on TRAIN only
-    o = pd.DataFrame(list(tr["original"]))
-    scale = {f: pd.to_numeric(o[f]).std() or 1.0 for f in num}
-    cats = {f: sorted(set(o[f].astype(str).str.strip())
-                      | set(pd.DataFrame(list(tr[OPTS[0]]))[f].astype(str).str.strip())
-                      | set(pd.DataFrame(list(tr[OPTS[1]]))[f].astype(str).str.strip())) for f in cat}
+    # Fit scaling and category lists on TRAIN only (no test leakage)
+    scale = {}
+    for f in num:
+        s = pd.to_numeric(pd.Series([d[f] for d in tr["original"]])).std()
+        scale[f] = s if np.isfinite(s) and s > 0 else 1.0
+    cats = {f: sorted({str(d[f]).strip() for col in ["original"] + OPTS for d in tr[col]}) for f in cat}
 
-    Xtr, ytr, qtr, *_ = to_ranking(tr, num, cat, scale, cats)
-    _, _, _, T1, T2, yte = to_ranking(te, num, cat, scale, cats)
+    X1, X2, ytr = build(tr, num, cat, scale, cats, a.flip)
+    Xtr, rtr, qtr = to_ranking(X1, X2, ytr)
+    T1, T2, yte = build(te, num, cat, scale, cats, a.flip)
 
     model = XGBRanker(objective="rank:pairwise", n_estimators=300, max_depth=4,
-                      learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, random_state=0)
-    model.fit(Xtr, ytr, qid=qtr)
+                      learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, random_state=a.seed)
+    model.fit(Xtr, rtr, qid=qtr)
 
-    # Reward = model score. Predict cf2 if its reward is higher.
-    T1, T2 = T1[Xtr.columns], T2[Xtr.columns]
-    pred = (model.predict(T2) > model.predict(T1)).astype(int)
-    prox = (T2["l1_norm"] < T1["l1_norm"]).astype(int).values
+    # Reward = model score. Predict cf2 if its reward is higher (ties -> cf1).
+    r1, r2 = model.predict(T1[Xtr.columns]), model.predict(T2[Xtr.columns])
+    pred = (r2 > r1).astype(int)
+    prox = (T2["l1_norm"].values < T1["l1_norm"].values).astype(int)
+    train_acc = accuracy_score(ytr, (model.predict(X2[Xtr.columns]) > model.predict(X1[Xtr.columns])).astype(int))
 
-    print(f"{a.study}: train {len(tr)} choices, test {len(te)} choices, "
-          f"{tr['pid'].nunique()} train participants")
+    print(f"{a.study}: train {len(tr)} choices ({tr['pid'].nunique()} people), "
+          f"test {len(te)} choices ({te['pid'].nunique()} people)")
     print(f"  features: numeric={num} categorical={cat}")
-    print(f"  test share where cf2 was picked: {yte.mean():.3f}  (majority-class baseline = "
-          f"{max(yte.mean(), 1 - yte.mean()):.3f})")
+    print(f"  test share where cf2 was picked: {yte.mean():.3f}")
     report("always pick cf1", yte, np.zeros_like(yte))
     report("proximity (smaller L1)", yte, prox)
     report("XGBoost ranker", yte, pred)
+    print(f"  XGBoost train accuracy: {train_acc:.3f}  (much higher than test = overfitting)")
     print("  (positive class for f1/prec/rec = 'participant picked cf2')")
+    if accuracy_score(yte, prox) < 0.45:
+        print("  WARNING: proximity is well below 50%. user_choice may be coded the other way; try --flip.")
+    return accuracy_score(yte, pred), accuracy_score(yte, prox)
 
 
 if __name__ == "__main__":
