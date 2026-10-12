@@ -1,0 +1,8 @@
+# Never commit real study data (IRB). Keep it outside this repo.
+data/
+real_data/
+*_real*.csv
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
