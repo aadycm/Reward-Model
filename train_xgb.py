@@ -45,13 +45,31 @@ def load(path):
     return df
 
 
+def to_num(values):
+    """Parse numbers, tolerating '108480' strings, thousands commas, '$' and stray spaces."""
+    s = pd.Series(list(values), dtype=object).map(lambda v: v if v is None else str(v))
+    s = s.str.replace(r"[,$\s]", "", regex=True)
+    return pd.to_numeric(s, errors="coerce")
+
+
 def split_types(df):
-    """Numeric = every value parses as a number (handles '108480' strings). Rest = categorical."""
+    """Numeric = at least 98% of values parse as numbers. Rest = categorical."""
     num, cat = [], []
     for k in df["original"].iloc[0]:
-        vals = pd.to_numeric(pd.Series([d[k] for col in ["original"] + OPTS for d in df[col]]), errors="coerce")
-        (num if vals.notna().all() else cat).append(k)
+        vals = to_num(d.get(k) for col in ["original"] + OPTS for d in df[col])
+        (num if vals.notna().mean() >= 0.98 else cat).append(k)
     return num, cat
+
+
+def drop_unreadable(df, num, name):
+    """Drop choices where any numeric feature in any of the 3 columns can't be read as a number."""
+    bad = np.zeros(len(df), dtype=bool)
+    for c in ["original"] + OPTS:
+        for f in num:
+            bad |= to_num(d.get(f) for d in df[c]).isna().values
+    if bad.any():
+        print(f"  note: dropped {bad.sum()} of {len(df)} {name} choices with unreadable numbers")
+    return df[~bad].reset_index(drop=True)
 
 
 def option_features(df, opt, num, cat, scale, cats):
@@ -61,7 +79,7 @@ def option_features(df, opt, num, cat, scale, cats):
     X = pd.DataFrame(index=df.index)
     l1 = pd.Series(0.0, index=df.index)
     for f in num:
-        ov, cv = pd.to_numeric(o[f], errors="coerce"), pd.to_numeric(c[f], errors="coerce")
+        ov, cv = to_num(o[f]).set_axis(df.index), to_num(c[f]).set_axis(df.index)
         d = (cv - ov) / scale[f]
         X[f"orig_{f}"] = ov
         X[f"delta_{f}"] = d
@@ -121,15 +139,16 @@ def main(argv=None):
         print(f"  test  numeric={sorted(num_te)} categorical={sorted(cat_te)}")
         for f in sorted(set(num) ^ set(num_te)):
             for name, df in [("train", tr), ("test", te)]:
-                n_bad = sum(pd.isna(pd.to_numeric(pd.Series([d.get(f) for d in df[c]]), errors="coerce")).sum()
+                n_bad = sum(to_num(d.get(f) for d in df[c]).isna().sum()
                             for c in ["original"] + OPTS)
                 print(f"  '{f}' in {name}: {n_bad} of {3 * len(df)} cells are not numbers")
         sys.exit(1)
+    tr, te = drop_unreadable(tr, num, "train"), drop_unreadable(te, num, "test")
 
     # Fit scaling and category lists on TRAIN only (no test leakage)
     scale = {}
     for f in num:
-        s = pd.to_numeric(pd.Series([d[f] for d in tr["original"]])).std()
+        s = to_num(d[f] for d in tr["original"]).std()
         scale[f] = s if np.isfinite(s) and s > 0 else 1.0
     cats = {f: sorted({str(d[f]).strip() for col in ["original"] + OPTS for d in tr[col]}) for f in cat}
 

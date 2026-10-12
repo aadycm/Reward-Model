@@ -112,8 +112,27 @@ def test_bad_labels_rejected():
     print("ok  user_choice values other than 0/1 stop the run with a clear message")
 
 
+def test_messy_numbers():
+    """A few odd loan_amount cells in train only (like the real study1 file)."""
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(6)
+        tr = oracle_rows(mm.STUDY1, 400, rng)
+        odd = {0: "12,345.50", 1: "", 2: "N/A"}         # first is fixable, other two are not
+        tr = [(p, s, {**o, "loan_amount": odd[i]} if i in odd else o, a, b, c)
+              for i, (p, s, o, a, b, c) in enumerate(tr)]
+        write_pair(d, "study1", tr, oracle_rows(mm.STUDY1, 100, rng), mm.STUDY1, False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            xgb, prox = tx.main(["--data", d, "--study", "study1"])
+        text = out.getvalue()
+    assert "numeric=['income', 'credit_score', 'loan_amount']" in text, text
+    assert "dropped 2 of 400 train choices" in text, text
+    assert prox == 1.0
+    print("ok  odd number cells: '12,345.50' is read, blanks/'N/A' rows are dropped and counted")
+
+
 if __name__ == "__main__":
     for t in [test_formats_parse, test_grouping, test_learns_known_rule, test_flip_mirrors,
-              test_no_signal_is_chance, test_bad_labels_rejected]:
+              test_no_signal_is_chance, test_bad_labels_rejected, test_messy_numbers]:
         t()
     print("\nAll tests passed.")
