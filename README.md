@@ -15,7 +15,7 @@ an IRB protocol: keep it outside this repo, on a secure machine only.
 | File | What it does |
 |---|---|
 | `make_mock_data.py` | Makes the four mock files. `--people N` for a bigger set, `--seed` to change it. |
-| `test_pipeline.py` | Sanity tests: parsing, grouping, recovers a known rule, no leakage, bad labels caught. |
+| `test_pipeline.py` | Sanity tests: parsing, grouping, recovers a known rule, no leakage, bad labels caught, memorisation exposed by `--cv`. |
 | `train_xgb.py` | XGBoost pairwise ranker (`rank:pairwise`). Reports accuracy, F1, precision, recall vs a proximity baseline. Prints summary numbers only. |
 | `mock_data/study{1,2}_preference_{train,test}.csv` | Mock data, 200 participants per study, 80/20 split per participant. |
 
@@ -27,7 +27,12 @@ python test_pipeline.py                        # should end with "All tests pass
 python train_xgb.py --study study1             # train + test on mock data
 python train_xgb.py --data /path/to/real --study study1   # real data, on a secure machine
 python train_xgb.py --data /path/to/real --study study1 --flip   # if user_choice 1 means cf1
+python train_xgb.py --data /path/to/real --study study1 --cv     # + unseen-people / unseen-scenario checks
 ```
+
+`--cv` pools train and test and runs 5-fold CV twice: once holding out whole participants, once
+holding out whole scenarios (same loan + same two options). If accuracy drops a lot on unseen
+scenarios, the fixed-split number came from memorising repeated scenarios.
 
 If the real files are named differently, pass them directly: `--train <file> --test <file>`.
 

@@ -131,8 +131,36 @@ def test_messy_numbers():
     print("ok  odd number cells: '12,345.50' is read, blanks/'N/A' rows are dropped and counted")
 
 
+def test_cv_catches_memorisation():
+    """Choices depend only on WHICH scenario it is (no rule), and scenarios repeat across people.
+    The fixed split looks great; testing on unseen scenarios must fall to ~chance."""
+    import re
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(7)
+        pool = []
+        for _ in range(60):
+            o = mm.random_original(mm.STUDY1, rng)
+            pool.append((o, mm.random_cf(o, mm.STUDY1, rng), mm.random_cf(o, mm.STUDY1, rng), int(rng.random() < 0.5)))
+        def rows(people, per):
+            out = []
+            for p in people:
+                for s, i in enumerate(rng.choice(len(pool), per, replace=False), 1):
+                    o, a, b, c = pool[i]
+                    out.append((p, s, o, a, b, c if rng.random() < 0.9 else 1 - c))
+            return out
+        write_pair(d, "study1", rows(range(1, 81), 40), rows(range(1, 81), 10), mm.STUDY1, False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fixed, _ = tx.main(["--data", d, "--study", "study1", "--cv"])
+        text = out.getvalue()
+    unseen = float(re.search(r"unseen SCENARIOS:.*?XGBoost +mean acc=([0-9.]+)", text, re.S).group(1))
+    assert fixed > 0.8, fixed
+    assert unseen < 0.62, unseen
+    print(f"ok  memorisation exposed: fixed split {fixed:.3f}, unseen scenarios {unseen:.3f}")
+
+
 if __name__ == "__main__":
     for t in [test_formats_parse, test_grouping, test_learns_known_rule, test_flip_mirrors,
-              test_no_signal_is_chance, test_bad_labels_rejected, test_messy_numbers]:
+              test_no_signal_is_chance, test_bad_labels_rejected, test_messy_numbers, test_cv_catches_memorisation]:
         t()
     print("\nAll tests passed.")

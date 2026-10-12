@@ -120,12 +120,74 @@ def report(name, y, pred):
           f"rec={recall_score(y, pred, zero_division=0):.3f}")
 
 
+def fit_predict(tr, te, num, cat, flip, seed):
+    """Fit on tr, score te. Scaling and category lists come from tr only (no test leakage)."""
+    scale = {}
+    for f in num:
+        sd = to_num(d[f] for d in tr["original"]).std()
+        scale[f] = sd if np.isfinite(sd) and sd > 0 else 1.0
+    cats = {f: sorted({str(d[f]).strip() for col in ["original"] + OPTS for d in tr[col]}) for f in cat}
+
+    X1, X2, ytr = build(tr, num, cat, scale, cats, flip)
+    Xtr, rtr, qtr = to_ranking(X1, X2, ytr)
+    T1, T2, yte = build(te, num, cat, scale, cats, flip)
+
+    model = XGBRanker(objective="rank:pairwise", n_estimators=300, max_depth=4,
+                      learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, random_state=seed)
+    model.fit(Xtr, rtr, qid=qtr)
+    # Reward = model score. Predict cf2 if its reward is higher (ties -> cf1).
+    pred = (model.predict(T2[Xtr.columns]) > model.predict(T1[Xtr.columns])).astype(int)
+    prox = (T2["l1_norm"].values < T1["l1_norm"].values).astype(int)
+    train_pred = (model.predict(X2[Xtr.columns]) > model.predict(X1[Xtr.columns])).astype(int)
+    return dict(y=yte, pred=pred, prox=prox, train_acc=accuracy_score(ytr, train_pred),
+                majority=np.full_like(yte, int(ytr.mean() > 0.5)))
+
+
+def scenario_key(df):
+    """Same loan + same two options = same scenario, whichever side each option was shown on."""
+    j = lambda d: json.dumps(d, sort_keys=True)
+    return [j(o) + "|" + "|".join(sorted([j(a), j(b)]))
+            for o, a, b in zip(df["original"], df[OPTS[0]], df[OPTS[1]])]
+
+
+def ci(acc, n):
+    half = 1.96 * np.sqrt(acc * (1 - acc) / n)
+    return f"{acc:.3f} (95% CI {acc - half:.3f}-{acc + half:.3f})"
+
+
+def run_cv(tr, te, num, cat, a):
+    from sklearn.model_selection import GroupKFold
+    df = pd.concat([tr, te]).reset_index(drop=True)
+    keys = pd.Series(scenario_key(df))
+    seen = set(scenario_key(tr))
+    print(f"\n  Scenario overlap: {keys.nunique()} unique scenarios in {len(df)} choices; "
+          f"{np.mean([k in seen for k in scenario_key(te)]):.1%} of the original test choices "
+          f"use a scenario that is also in train")
+    for label, groups in [("unseen PEOPLE", df["pid"].values), ("unseen SCENARIOS", keys.factorize()[0])]:
+        k = min(a.folds, len(np.unique(groups)))
+        res = {"XGBoost": [], "proximity": [], "majority side": [], "train": []}
+        for i, (itr, ite) in enumerate(GroupKFold(n_splits=k).split(df, groups=groups)):
+            r = fit_predict(df.iloc[itr].reset_index(drop=True), df.iloc[ite].reset_index(drop=True),
+                            num, cat, a.flip, a.seed + i)
+            res["XGBoost"].append(accuracy_score(r["y"], r["pred"]))
+            res["proximity"].append(accuracy_score(r["y"], r["prox"]))
+            res["majority side"].append(accuracy_score(r["y"], r["majority"]))
+            res["train"].append(r["train_acc"])
+        print(f"  {k}-fold CV, test on {label}:")
+        for name in ["majority side", "proximity", "XGBoost"]:
+            v = np.array(res[name])
+            print(f"    {name:<14} mean acc={v.mean():.3f}  (folds range {v.min():.3f}-{v.max():.3f})")
+        print(f"    XGBoost train acc={np.mean(res['train']):.3f}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="mock_data")
     ap.add_argument("--study", default="study1", choices=["study1", "study2"])
     ap.add_argument("--train"); ap.add_argument("--test")
     ap.add_argument("--flip", action="store_true", help="use if user_choice 1 means cf1")
+    ap.add_argument("--cv", action="store_true", help="also run the unseen-people and unseen-scenario checks")
+    ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
 
@@ -145,39 +207,24 @@ def main(argv=None):
         sys.exit(1)
     tr, te = drop_unreadable(tr, num, "train"), drop_unreadable(te, num, "test")
 
-    # Fit scaling and category lists on TRAIN only (no test leakage)
-    scale = {}
-    for f in num:
-        s = to_num(d[f] for d in tr["original"]).std()
-        scale[f] = s if np.isfinite(s) and s > 0 else 1.0
-    cats = {f: sorted({str(d[f]).strip() for col in ["original"] + OPTS for d in tr[col]}) for f in cat}
-
-    X1, X2, ytr = build(tr, num, cat, scale, cats, a.flip)
-    Xtr, rtr, qtr = to_ranking(X1, X2, ytr)
-    T1, T2, yte = build(te, num, cat, scale, cats, a.flip)
-
-    model = XGBRanker(objective="rank:pairwise", n_estimators=300, max_depth=4,
-                      learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, random_state=a.seed)
-    model.fit(Xtr, rtr, qid=qtr)
-
-    # Reward = model score. Predict cf2 if its reward is higher (ties -> cf1).
-    r1, r2 = model.predict(T1[Xtr.columns]), model.predict(T2[Xtr.columns])
-    pred = (r2 > r1).astype(int)
-    prox = (T2["l1_norm"].values < T1["l1_norm"].values).astype(int)
-    train_acc = accuracy_score(ytr, (model.predict(X2[Xtr.columns]) > model.predict(X1[Xtr.columns])).astype(int))
-
+    r = fit_predict(tr, te, num, cat, a.flip, a.seed)
+    yte, n = r["y"], len(r["y"])
+    shared = len(set(tr["pid"]) & set(te["pid"]))
     print(f"{a.study}: train {len(tr)} choices ({tr['pid'].nunique()} people), "
-          f"test {len(te)} choices ({te['pid'].nunique()} people)")
+          f"test {len(te)} choices ({te['pid'].nunique()} people, {shared} also in train)")
     print(f"  features: numeric={num} categorical={cat}")
     print(f"  test share where cf2 was picked: {yte.mean():.3f}")
     report("always pick cf1", yte, np.zeros_like(yte))
-    report("proximity (smaller L1)", yte, prox)
-    report("XGBoost ranker", yte, pred)
-    print(f"  XGBoost train accuracy: {train_acc:.3f}  (much higher than test = overfitting)")
+    report("proximity (smaller L1)", yte, r["prox"])
+    report("XGBoost ranker", yte, r["pred"])
+    print(f"  XGBoost test acc {ci(accuracy_score(yte, r['pred']), n)}")
+    print(f"  XGBoost train accuracy: {r['train_acc']:.3f}  (much higher than test = overfitting)")
     print("  (positive class for f1/prec/rec = 'participant picked cf2')")
-    if accuracy_score(yte, prox) < 0.45:
+    if accuracy_score(yte, r["prox"]) < 0.45:
         print("  WARNING: proximity is well below 50%. user_choice may be coded the other way; try --flip.")
-    return accuracy_score(yte, pred), accuracy_score(yte, prox)
+    if a.cv:
+        run_cv(tr, te, num, cat, a)
+    return accuracy_score(yte, r["pred"]), accuracy_score(yte, r["prox"])
 
 
 if __name__ == "__main__":
