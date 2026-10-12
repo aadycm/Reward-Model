@@ -114,8 +114,17 @@ def main(argv=None):
     tr = load(a.train or f"{a.data}/{a.study}_preference_train.csv")
     te = load(a.test or f"{a.data}/{a.study}_preference_test.csv")
     num, cat = split_types(tr)
-    if split_types(te) != (num, cat):
-        sys.exit("Train and test files have different features or types.")
+    num_te, cat_te = split_types(te)
+    if set(num) != set(num_te) or set(cat) != set(cat_te):
+        print("Train and test files disagree. Details (names and counts only, no values):")
+        print(f"  train numeric={sorted(num)} categorical={sorted(cat)}")
+        print(f"  test  numeric={sorted(num_te)} categorical={sorted(cat_te)}")
+        for f in sorted(set(num) ^ set(num_te)):
+            for name, df in [("train", tr), ("test", te)]:
+                n_bad = sum(pd.isna(pd.to_numeric(pd.Series([d.get(f) for d in df[c]]), errors="coerce")).sum()
+                            for c in ["original"] + OPTS)
+                print(f"  '{f}' in {name}: {n_bad} of {3 * len(df)} cells are not numbers")
+        sys.exit(1)
 
     # Fit scaling and category lists on TRAIN only (no test leakage)
     scale = {}
