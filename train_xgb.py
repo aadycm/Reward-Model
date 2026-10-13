@@ -14,8 +14,7 @@ import pandas as pd
 from xgboost import XGBRanker
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-# !! CHECK WITH FIRDAUS: what does user_choice mean? Assumed: 0 = picked cf1, 1 = picked cf2.
-# If it is the other way round, run with --flip. Getting it wrong turns accuracy into (1 - accuracy).
+# user_choice: 0 = picked cf1, 1 = picked cf2 (confirmed by Firdaus, Oct 2026).
 OPTS = ["cf1_feats_values", "cf2_feats_values"]
 COLS = ["pid", "scenario_num", "original"] + OPTS + ["user_choice"]
 
@@ -61,14 +60,23 @@ def split_types(df):
     return num, cat
 
 
-def drop_unreadable(df, num, name):
+def drop_unreadable(df, num, name, show=False):
     """Drop choices where any numeric feature in any of the 3 columns can't be read as a number."""
     bad = np.zeros(len(df), dtype=bool)
+    where = {}
     for c in ["original"] + OPTS:
         for f in num:
-            bad |= to_num(d.get(f) for d in df[c]).isna().values
+            m = to_num(d.get(f) for d in df[c]).isna().values
+            for i in np.flatnonzero(m):
+                where.setdefault(i, []).append(f"{c}.{f}")
+            bad |= m
     if bad.any():
         print(f"  note: dropped {bad.sum()} of {len(df)} {name} choices with unreadable numbers")
+        if show:
+            for i in sorted(where):
+                # data row i is on file line i + 2 (line 1 is the header)
+                print(f"    file line {i + 2} (data row {i + 1}): pid={df['pid'].iloc[i]}, "
+                      f"scenario_num={df['scenario_num'].iloc[i]}, bad cell(s): {', '.join(where[i])}")
     return df[~bad].reset_index(drop=True)
 
 
@@ -188,6 +196,8 @@ def main(argv=None):
     ap.add_argument("--flip", action="store_true", help="use if user_choice 1 means cf1")
     ap.add_argument("--cv", action="store_true", help="also run the unseen-people and unseen-scenario checks")
     ap.add_argument("--folds", type=int, default=5)
+    ap.add_argument("--show-dropped", action="store_true",
+                    help="print file line numbers of dropped rows (no values)")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
 
@@ -205,7 +215,8 @@ def main(argv=None):
                             for c in ["original"] + OPTS)
                 print(f"  '{f}' in {name}: {n_bad} of {3 * len(df)} cells are not numbers")
         sys.exit(1)
-    tr, te = drop_unreadable(tr, num, "train"), drop_unreadable(te, num, "test")
+    tr = drop_unreadable(tr, num, "train", a.show_dropped)
+    te = drop_unreadable(te, num, "test", a.show_dropped)
 
     r = fit_predict(tr, te, num, cat, a.flip, a.seed)
     yte, n = r["y"], len(r["y"])

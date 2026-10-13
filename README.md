@@ -26,13 +26,14 @@ pip install -r requirements.txt
 python test_pipeline.py                        # should end with "All tests passed."
 python train_xgb.py --study study1             # train + test on mock data
 python train_xgb.py --data /path/to/real --study study1   # real data, on a secure machine
-python train_xgb.py --data /path/to/real --study study1 --flip   # if user_choice 1 means cf1
 python train_xgb.py --data /path/to/real --study study1 --cv     # + unseen-people / unseen-scenario checks
 ```
 
 `--cv` pools train and test and runs 5-fold CV twice: once holding out whole participants, once
 holding out whole scenarios (same loan + same two options). If accuracy drops a lot on unseen
 scenarios, the fixed-split number came from memorising repeated scenarios.
+
+`--show-dropped` prints the file line numbers of rows dropped for unreadable numbers (no values).
 
 If the real files are named differently, pass them directly: `--train <file> --test <file>`.
 
@@ -41,7 +42,7 @@ If the real files are named differently, pass them directly: `--train <file> --t
 - `pid`, `scenario_num`, `original`, `cf1_feats_values`, `cf2_feats_values`, `user_choice`
 - Study 1 features: `income`, `credit_score`, `loan_amount`, `employment_type`, `education`
 - Study 2 features: `income_annum`, `loan_amount`, `loan_term`, `education`, `self_employed`, `credit_score`
-- `user_choice`: **assumed** 0 = picked cf1, 1 = picked cf2 (to be confirmed)
+- `user_choice`: 0 = picked cf1, 1 = picked cf2 (confirmed)
 - The choice comes from a hidden rule: people prefer options with a small, weighted L1 change and
   fewer changed features, with per-person weights and noise.
 
